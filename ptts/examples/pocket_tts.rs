@@ -550,6 +550,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
             Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?.to::<Q::T>()?;
 
         let mut eos_countdown: Option<usize> = None;
+        let mut eos_logits: Vec<f32> = Vec::new();
 
         let (latent_tx, latent_rx) = std::sync::mpsc::channel::<Tensor<Q::T, _>>();
         let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -581,7 +582,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
 
         for step in 0..max_frames {
             let step_start = std::time::Instant::now();
-            let (next_latent, is_eos) = match cfg_state.as_mut() {
+            let (next_latent, is_eos, eos_logit) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => model.generate_step_cfg(
                     &mut tts_state,
                     null_state,
@@ -592,6 +593,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 None => model.generate_step(&mut tts_state, &prev_latent, &mut rng)?,
             };
             backbone_step_timings_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
+            eos_logits.push(eos_logit);
             latent_tx.send(next_latent.clone())?;
 
             if is_eos && eos_countdown.is_none() {
@@ -616,6 +618,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         is_done.store(true, std::sync::atomic::Ordering::SeqCst);
         let audio = jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
         all_audios.push(audio);
+        tracing::info!(?eos_logits, "eos logits for chunk");
     }
     let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Q::B>>>();
     let audio = Tensor::cat(&all_audios, 2)?;

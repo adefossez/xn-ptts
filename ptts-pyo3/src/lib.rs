@@ -446,7 +446,7 @@ fn run_generate<Q: BackendQ>(
     seed: u64,
     frames_after_eos: usize,
     check_py_interrupts_every: Option<usize>,
-) -> Result<Vec<f32>, xn::Error> {
+) -> Result<(Vec<f32>, Vec<f32>), xn::Error> {
     let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
@@ -479,13 +479,15 @@ fn run_generate<Q: BackendQ>(
     });
 
     let mut eos_countdown: Option<usize> = None;
+    let mut eos_logits: Vec<f32> = Vec::with_capacity(max_frames);
     for step in 0..max_frames {
-        let (next_latent, is_eos) = match cfg_state.as_mut() {
+        let (next_latent, is_eos, eos_logit) = match cfg_state.as_mut() {
             Some((cfg_coef, cfg_state)) => {
                 model.generate_step_cfg(&mut state, cfg_state, *cfg_coef, &prev_latent, &mut rng)?
             }
             None => model.generate_step(&mut state, &prev_latent, &mut rng)?,
         };
+        eos_logits.push(eos_logit);
         // Rather than raising an error when the channel is closed, we break out of the loop
         // so as to get a proper error message from the decode thread.
         if latent_tx.send(next_latent.clone()).is_err() {
@@ -512,7 +514,7 @@ fn run_generate<Q: BackendQ>(
 
     let audio = decode_handle.join().map_err(|_| xn::Error::msg("decode thread panicked"))??;
     let pcm = audio.to_vec()?;
-    Ok(pcm)
+    Ok((pcm, eos_logits))
 }
 
 /// Do not implement Clone on this as it would result in switching is_done
@@ -576,7 +578,7 @@ fn run_generate_background<Q: BackendQ>(
             if is_done.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            let (next_latent, is_eos) = match cfg_state.as_mut() {
+            let (next_latent, is_eos, _eos_logit) = match cfg_state.as_mut() {
                 Some((cfg_coef, cfg_state)) => model.generate_step_cfg(
                     &mut state,
                     cfg_state,
@@ -663,6 +665,7 @@ impl<Q: BackendQ> ModelStateB<Q> {
         self.model.flow_lm.conditioner.tokenize(text).w()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_audio<'py>(
         &self,
         py: Python<'py>,
@@ -671,14 +674,15 @@ impl<Q: BackendQ> ModelStateB<Q> {
         seed: u64,
         pad_to: Option<usize>,
         check_py_interrupts_every: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        return_eos_logits: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
         let cfg_state = self.cfg_state.clone();
         let text = text.to_string();
 
-        let pcm = py
-            .detach(move || -> xn::Result<Vec<f32>> {
+        let (pcm, eos_logits) = py
+            .detach(move || -> xn::Result<(Vec<f32>, Vec<f32>)> {
                 let (text, frames_after_eos) = ptts::tts_model::prepare_text_prompt(&text);
                 let mut tokens = model.flow_lm.conditioner.tokenize(&text)?;
                 if let Some(pad_to) = pad_to
@@ -696,7 +700,7 @@ impl<Q: BackendQ> ModelStateB<Q> {
             })
             .w()?;
 
-        Ok(PyArray1::from_vec(py, pcm))
+        pcm_result(py, pcm, eos_logits, return_eos_logits)
     }
 
     fn generate_bt(
@@ -734,6 +738,7 @@ impl<Q: BackendQ> ModelStateB<Q> {
         Ok(Receiver::new(recv))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_audio_for_tokens<'py>(
         &self,
         py: Python<'py>,
@@ -742,7 +747,8 @@ impl<Q: BackendQ> ModelStateB<Q> {
         seed: u64,
         frames_after_eos: usize,
         check_py_interrupts_every: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        return_eos_logits: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
         let cfg_state = self.cfg_state.clone();
@@ -760,8 +766,8 @@ impl<Q: BackendQ> ModelStateB<Q> {
                 new_tokens.push(token as u32);
             }
         }
-        let pcm = py
-            .detach(move || -> xn::Result<Vec<f32>> {
+        let (pcm, eos_logits) = py
+            .detach(move || -> xn::Result<(Vec<f32>, Vec<f32>)> {
                 run_generate(
                     model,
                     state,
@@ -775,7 +781,24 @@ impl<Q: BackendQ> ModelStateB<Q> {
             })
             .w()?;
 
-        Ok(PyArray1::from_vec(py, pcm))
+        pcm_result(py, pcm, eos_logits, return_eos_logits)
+    }
+}
+
+/// Build the Python return value for a generation call: the PCM array on its own, or a
+/// `(pcm, eos_logits)` tuple when `return_eos_logits` is set.
+fn pcm_result(
+    py: Python<'_>,
+    pcm: Vec<f32>,
+    eos_logits: Vec<f32>,
+    return_eos_logits: bool,
+) -> PyResult<Bound<'_, PyAny>> {
+    let pcm = PyArray1::from_vec(py, pcm);
+    if return_eos_logits {
+        let eos_logits = PyArray1::from_vec(py, eos_logits);
+        Ok((pcm, eos_logits).into_pyobject(py)?.into_any())
+    } else {
+        Ok(pcm.into_any())
     }
 }
 
@@ -789,7 +812,8 @@ impl ModelState {
         on_state!(&self.0, |s| s.tokenize(text))
     }
 
-    #[pyo3(signature = (text, temperature=0.5, seed=4242424242424242, pad_to=None, check_py_interrupts_every=5))]
+    #[pyo3(signature = (text, temperature=0.5, seed=4242424242424242, pad_to=None, check_py_interrupts_every=5, return_eos_logits=false))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_audio<'py>(
         &self,
         py: Python<'py>,
@@ -798,14 +822,16 @@ impl ModelState {
         seed: u64,
         pad_to: Option<usize>,
         check_py_interrupts_every: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        return_eos_logits: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         on_state!(&self.0, |s| s.generate_audio(
             py,
             text,
             temperature,
             seed,
             pad_to,
-            check_py_interrupts_every
+            check_py_interrupts_every,
+            return_eos_logits
         ))
     }
 
@@ -824,7 +850,8 @@ impl ModelState {
         on_state!(&self.0, |s| s.generate_bt(py, text, temperature, seed, pad_to))
     }
 
-    #[pyo3(signature = (tokens, temperature=0.5, seed=4242424242424242, frames_after_eos=1, check_py_interrupts_every=5))]
+    #[pyo3(signature = (tokens, temperature=0.5, seed=4242424242424242, frames_after_eos=1, check_py_interrupts_every=5, return_eos_logits=false))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_audio_for_tokens<'py>(
         &self,
         py: Python<'py>,
@@ -833,14 +860,16 @@ impl ModelState {
         seed: u64,
         frames_after_eos: usize,
         check_py_interrupts_every: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        return_eos_logits: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         on_state!(&self.0, |s| s.generate_audio_for_tokens(
             py,
             tokens,
             temperature,
             seed,
             frames_after_eos,
-            check_py_interrupts_every
+            check_py_interrupts_every,
+            return_eos_logits
         ))
     }
 }
@@ -928,6 +957,7 @@ fn load_model_<Q: BackendQ>(
     model_file: String,
     config: Option<String>,
     eos_threshold: Option<f32>,
+    cfg_on_eos: Option<bool>,
     dev: Q::B,
 ) -> xn::Result<ModelB<Q>> {
     let (model_path, tokenizer_path, cfg, voices) = match config {
@@ -1026,6 +1056,8 @@ fn load_model_<Q: BackendQ>(
     } else {
         model
     };
+    let model =
+        if let Some(cfg_on_eos) = cfg_on_eos { model.with_cfg_on_eos(cfg_on_eos) } else { model };
     // Probe under the speaker prefix: a dedicated speaker codec ships its
     // encoder as `<speaker_mimi.prefix>.encoder.*` with no `mimi.encoder.*`.
     let enc_probe = format!("{}.encoder.model.0.conv.weight", cfg.speaker_mimi_prefix());
@@ -1048,7 +1080,7 @@ fn load_model_<Q: BackendQ>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (temperature=0.5, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None, device=None, quant=None))]
+#[pyo3(signature = (temperature=0.5, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None, cfg_on_eos=None, device=None, quant=None))]
 #[allow(clippy::too_many_arguments)]
 fn load_model(
     py: Python<'_>,
@@ -1057,6 +1089,7 @@ fn load_model(
     model_file: &str,
     config: Option<&str>,
     eos_threshold: Option<f32>,
+    cfg_on_eos: Option<bool>,
     device: Option<&str>,
     quant: Option<&str>,
 ) -> PyResult<Model> {
@@ -1075,6 +1108,7 @@ fn load_model(
                     model_file,
                     config,
                     eos_threshold,
+                    cfg_on_eos,
                     xn::CpuDevice,
                 )?;
                 Ok(Model(ModelV::$variant(model)))
@@ -1109,6 +1143,7 @@ fn load_model(
                     model_file,
                     config,
                     eos_threshold,
+                    cfg_on_eos,
                     dev,
                 )?;
                 Ok(Model(ModelV::Cuda(model)))
@@ -1127,6 +1162,7 @@ fn load_model(
                     model_file,
                     config,
                     eos_threshold,
+                    cfg_on_eos,
                     dev,
                 )?;
                 Ok(Model(ModelV::Vulkan(model)))
@@ -1145,6 +1181,7 @@ fn load_model(
                     model_file,
                     config,
                     eos_threshold,
+                    cfg_on_eos,
                     dev,
                 )?;
                 Ok(Model(ModelV::Metal(model)))
